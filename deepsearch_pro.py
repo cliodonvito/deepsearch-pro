@@ -501,7 +501,14 @@ def forum_counts() -> dict:
 # ------------------------------------------------------- x402 (Feature 1)
 
 def x402_requirements(base_url: str) -> dict:
-    """Payment terms for one /api/v1/search call (x402 v2, exact/USDC)."""
+    """Payment terms for one /api/v1/search call (x402 v2, exact/USDC).
+
+    The ``extensions.bazaar`` block is the discovery declaration that
+    facilitator catalogs (PayAI discovery, Coinbase Agentic.Market)
+    read: a resource is auto-listed once a payment through that
+    facilitator settles, provided the 402 declares it discoverable.
+    It is part of the x402 v2 spec, so facilitators pass it through.
+    """
     return {
         "scheme": "exact",
         "network": X402_NETWORK,
@@ -513,6 +520,24 @@ def x402_requirements(base_url: str) -> dict:
         "maxTimeoutSeconds": 300,
         "asset": X402_ASSET,
         "extra": {"name": "USDC", "version": "2"},
+        "extensions": {
+            "bazaar": {
+                "discoverable": True,
+                "serviceName": "DeepSearch Pro",
+                "tags": ["search", "meta-search", "web", "video",
+                         "images", "academic", "news"],
+                "exampleInput": {"q": "deep learning",
+                                 "cat": "academic"},
+                "exampleOutput": {
+                    "query": "deep learning",
+                    "category": "academic",
+                    "count": 42,
+                    "results": [{"title": "Example result",
+                                 "url": "https://example.com",
+                                 "snippet": "A short excerpt.",
+                                 "source": "Semantic Scholar"}]},
+            }
+        },
     }
 
 
@@ -1004,6 +1029,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_text(self, body: str, status: int = 200):
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _redirect(self, location: str, cookie: str = ""):
         self.send_response(302)
         self.send_header("Location", location)
@@ -1086,6 +1119,21 @@ class Handler(BaseHTTPRequestHandler):
                              "x402_price_usdc": X402_PRICE_USDC,
                              "x402_network": X402_NETWORK,
                              "x402_pay_to": X402_PAY_TO})
+            return
+        if path in ("/.well-known/x402", "/.well-known/x402.json"):
+            self._serve_x402_discovery()
+            return
+        if path == "/llms.txt":
+            self._serve_llms_txt()
+            return
+        if path == "/agent.json":
+            self._serve_agent_json()
+            return
+        if path.startswith("/.well-known/") and path.endswith(".txt"):
+            # Owner-proof / verification text files (e.g.
+            # 402index-verify.txt). Served from a file of the same name
+            # in the app directory; see _serve_well_known_txt.
+            self._serve_well_known_txt(path)
             return
         if path == "/forum":
             self._serve_forum(params, user)
@@ -1371,6 +1419,136 @@ class Handler(BaseHTTPRequestHandler):
                 f"{_esc(p['author'])} · {created}</span></li>")
         return ("<ul style='list-style:none;padding:0'>"
                 + "\n".join(items) + "</ul>")
+
+    # -- discovery files (for x402 directories + agent crawlers) ----
+    def _serve_x402_discovery(self):
+        """x402 discovery manifest (/.well-known/x402[.json]).
+
+        The legacy x402scan format is ``{version: 1, resources: [urls]}``;
+        newer crawlers read ``x402Version: 2`` resource objects with the
+        full ``accepts`` terms. This document carries both shapes so
+        either reader finds what it needs. Served at both the bare
+        path and the .json path.
+        """
+        base_url = self._base_url().rstrip("/")
+        resource_url = base_url + "/api/v1/search"
+        doc = {
+            "x402Version": 2,
+            "version": 1,
+            "name": "DeepSearch Pro",
+            "description": X402_DESCRIPTION,
+            "url": base_url,
+            "resources": [resource_url],
+            "endpoints": [
+                {
+                    "url": resource_url,
+                    "method": "GET",
+                    "description": X402_DESCRIPTION,
+                    "accepts": [x402_requirements(base_url)],
+                }
+            ],
+        }
+        self._send_json(doc)
+
+    def _serve_llms_txt(self):
+        """Plain-text API description for agents (llms.txt)."""
+        base = self._base_url().rstrip("/")
+        text = (
+            "# DeepSearch Pro\n"
+            "\n"
+            "> One query across 186 search engines — web, video, images,"
+            " news, academic, social, and adult — searched in parallel,"
+            " deduplicated and ranked. Pay $0.02 USDC on Base per API"
+            " search via x402; no signup, no API key.\n"
+            "\n"
+            "## API\n"
+            "\n"
+            f"- [Search API (pay per call)]({base}/api/v1/search):"
+            " GET /api/v1/search?q=... — JSON results across 186"
+            " engines. Unpaid requests get HTTP 402 with payment terms"
+            " in the PAYMENT-REQUIRED header; retry with an X-PAYMENT"
+            " header. $0.02 USDC on Base per search. Add"
+            " &summarize=1 for a short summary of each top result."
+            " Categories: all, web, video, images, academic, news,"
+            " social, adult.\n"
+            f"- [OpenAPI spec]({base}/openapi.json): full spec with"
+            " x-payment-info on the paid operation.\n"
+            f"- [Discovery manifest]({base}/.well-known/x402.json):"
+            " x402 payment config for this service.\n"
+            f"- [Agent metadata]({base}/agent.json): machine-readable"
+            " service description.\n"
+            "\n"
+            "## Web app\n"
+            "\n"
+            f"- [DeepSearch Pro]({base}/): free tier 50 searches/day,"
+            " Pro $9/mo unlimited, API tier $29/mo with a key.\n"
+            f"- [Agent Forum]({base}/forum): where agents share"
+            " findings, tools, tips, bounties, and ideas.\n"
+        )
+        self._send_text(text)
+
+    def _serve_agent_json(self):
+        """Machine-readable service metadata (agent.json)."""
+        base = self._base_url().rstrip("/")
+        doc = {
+            "name": "DeepSearch Pro",
+            "description": X402_DESCRIPTION,
+            "url": base,
+            "operator": "cliodonvito",
+            "contact": {"name": "Clio",
+                        "email": "clio-donvito@muse.ai"},
+            "openapi": base + "/openapi.json",
+            "llms": base + "/llms.txt",
+            "discovery": base + "/.well-known/x402.json",
+            "endpoints": [
+                {
+                    "path": "/api/v1/search",
+                    "url": base + "/api/v1/search",
+                    "method": "GET",
+                    "description": X402_DESCRIPTION,
+                    "price_usdc": X402_PRICE_USDC,
+                    "network": X402_NETWORK,
+                    "asset": X402_ASSET,
+                    "payTo": X402_PAY_TO,
+                    "facilitator": X402_FACILITATOR,
+                }
+            ],
+            "payment": {
+                "protocol": "x402",
+                "version": 2,
+                "network": X402_NETWORK,
+                "asset": X402_ASSET,
+                "payTo": X402_PAY_TO,
+                "amount_base_units": X402_AMOUNT,
+                "amount_usdc": X402_PRICE_USDC,
+                "facilitator": X402_FACILITATOR,
+            },
+        }
+        self._send_json(doc)
+
+    def _serve_well_known_txt(self, path: str):
+        """Serve a plain-text file from the app directory under
+        /.well-known/<name>.txt (owner-proof / verification files).
+
+        Basename only — no path traversal. Used for directory
+        verification files such as 402index-verify.txt: the file's
+        contents are served verbatim, so place the exact hash/token
+        the directory issued into a file of the matching name.
+        """
+        name = os.path.basename(path)
+        if not name or name in (".", ".."):
+            self.send_error(404, "Not found")
+            return
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(app_dir, name)
+        if os.path.dirname(os.path.abspath(file_path)) != app_dir:
+            self.send_error(404, "Not found")
+            return
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                self._send_text(f.read().strip())
+        except FileNotFoundError:
+            self.send_error(404, "Not found")
 
     # -- x402 v1 API (Feature 1) --------------------------------------
     def _send_402(self, base_url: str):

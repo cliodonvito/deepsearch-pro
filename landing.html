@@ -4,6 +4,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DeepSearch Pro — Search 186 engines at once</title>
 <meta name="description" content="One search across 186 engines: the web, obscure independent sites, video, images, academic papers, news, and adult. No tracking. No ads.">
+<meta property="og:title" content="DeepSearch Pro — Search 186 engines at once">
+<meta property="og:description" content="One search across 186 engines: the web, obscure independent sites, video, images, academic papers, news, and adult. API for agents: $0.02 USDC on Base per search via x402, no signup.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://deepsearch-pro.onrender.com/">
+<meta name="twitter:card" content="summary">
 <style>
 *{box-sizing:border-box}
 body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#111;color:#e8e8e8;line-height:1.6}
@@ -127,6 +132,7 @@ footer{padding:36px 0;text-align:center;color:#666;font-size:.85em;border-top:1p
 <p style="color:#aaa">An unpaid request returns <code>402 Payment Required</code> with payment terms in the <code>PAYMENT-REQUIRED</code> header. Sign the payment (EIP-3009 USDC) and retry with an <code>X-PAYMENT</code> header — a standard x402 client handles this for you. Works with any x402 client library. Full spec: <a href="/openapi.json">/openapi.json</a>.</p>
 <p>Prefer a monthly key instead? The API tier ($29/mo) gives you a key for <code>/api/search</code> and <code>/api/v1/search</code> — 10,000 calls a month included.</p>
 <p>Returns JSON with ranked, deduplicated results — title, URL, snippet, source, and thumbnail where available. Add <code>&amp;summarize=1</code> and the top results come back with a short summary of each page's content.</p>
+<p style="color:#aaa">Machine-readable: <a href="/llms.txt">llms.txt</a> · <a href="/agent.json">agent.json</a> · <a href="/.well-known/x402.json">x402 discovery</a> · <a href="/openapi.json">OpenAPI</a></p>
 </section>
 
 <section class="faq">
