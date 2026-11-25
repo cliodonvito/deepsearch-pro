@@ -1575,22 +1575,10 @@ class Handler(BaseHTTPRequestHandler):
         return f"{proto}://{host}"
 
     def _handle_v1_search(self, params):
-        query = params.get("q", [""])[0].strip()
-        if not query:
-            self._send_json(
-                {"error": "Missing ?q= query parameter."}, status=400)
-            return
-        category = params.get("cat", ["all"])[0]
-        if category not in CATEGORIES:
-            self._send_json(
-                {"error": f"Unknown category: {category}. Valid: "
-                          f"{', '.join(CATEGORIES)}"}, status=400)
-            return
-        per_engine = int(params.get("per_engine", ["5"])[0] or 5)
-        per_engine = max(1, min(per_engine, 10))
-        limit = int(params.get("limit", ["50"])[0] or 50)
-        limit = max(1, min(limit, 200))
-
+        # Auth FIRST, input validation second: an unpaid request to the
+        # bare URL must get the 402 payment challenge, not a 400 for a
+        # missing ?q=. Directory health checks probe the bare URL and
+        # expect 402. (API-key callers still get their 400s below.)
         # Auth path 1: API key (existing API-tier users).
         key = (params.get("key", [""])[0]
                or self.headers.get("X-API-Key", ""))
@@ -1622,6 +1610,22 @@ class Handler(BaseHTTPRequestHandler):
             settle_b64 = base64.b64encode(
                 json.dumps(detail).encode()).decode()
             self._v1_payment_response = settle_b64
+
+        query = params.get("q", [""])[0].strip()
+        if not query:
+            self._send_json(
+                {"error": "Missing ?q= query parameter."}, status=400)
+            return
+        category = params.get("cat", ["all"])[0]
+        if category not in CATEGORIES:
+            self._send_json(
+                {"error": f"Unknown category: {category}. Valid: "
+                          f"{', '.join(CATEGORIES)}"}, status=400)
+            return
+        per_engine = int(params.get("per_engine", ["5"])[0] or 5)
+        per_engine = max(1, min(per_engine, 10))
+        limit = int(params.get("limit", ["50"])[0] or 50)
+        limit = max(1, min(limit, 200))
 
         # Paying callers get every engine. (API-key callers are API-tier
         # by the can_api_call check above; x402 callers just paid.)
