@@ -1,0 +1,10 @@
+# DeepSearch Pro on Render
+# https://render.com/docs/yaml-spec
+services:
+  - type: web
+    name: deepsearch-pro
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 deepsearch_pro.py
+    healthCheckPath: /

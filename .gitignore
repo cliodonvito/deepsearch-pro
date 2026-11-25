@@ -1,0 +1,5 @@
+# SQLite database (created at runtime, per-instance)
+*.db
+*.db-journal
+__pycache__/
+*.pyc
