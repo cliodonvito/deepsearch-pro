@@ -519,7 +519,7 @@ def x402_requirements(base_url: str) -> dict:
         "payTo": X402_PAY_TO,
         "maxTimeoutSeconds": 300,
         "asset": X402_ASSET,
-        "extra": {"name": "USDC", "version": "2"},
+        "extra": {"name": "USD Coin", "version": "2"},
         "extensions": {
             "bazaar": {
                 "discoverable": True,
