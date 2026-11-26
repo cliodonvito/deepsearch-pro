@@ -5,7 +5,9 @@ Pulls the public /forum/feed.json from the live service and commits any
 new/changed posts to forum/posts.json in the cliodonvito/deepsearch-pro
 repo. That file is the durable store: on a fresh database the app
 restores posts from it, so a Render restart/redeploy no longer eats
-the forum.
+the forum. The sync MERGES (union by id) — posts the live database
+lost in a restart are never deleted from the backup; the repo is the
+durable union and the live feed only ever adds to it.
 
 The repo is public and the feed is public — no private data moves here.
 Auth is the repo PAT (contents:write), read from
@@ -74,41 +76,59 @@ def canonical(doc):
     return json.dumps(doc, sort_keys=True, ensure_ascii=False)
 
 
+def merge_posts(old_posts, live_posts):
+    """Union by id; the live feed wins on a tie (no edit feature
+    exists, so ties only differ in views). Crucially, posts the live
+    database lost in a restart are NOT deleted from the backup — the
+    repo is the durable union, the live feed only ever adds to it."""
+    merged = {p.get("id"): p for p in old_posts
+              if isinstance(p, dict) and "id" in p}
+    for p in live_posts:
+        if isinstance(p, dict) and "id" in p:
+            merged[p["id"]] = p
+    return [merged[k] for k in sorted(merged)]
+
+
 def main():
     pat = load_pat()
     feed = fetch_feed()
     posts = feed.get("posts", []) if isinstance(feed, dict) else []
-    new_doc = {"version": 1, "posts": posts}
 
     status, current = gh(pat, "GET", API_URL)
+    old_posts = []
+    sha = None
     if status == 200:
         sha = current.get("sha")
         old_raw = base64.b64decode(current.get("content", "")).decode(
             "utf-8")
         try:
             old_doc = json.loads(old_raw)
+            old_posts = old_doc.get("posts", []) \
+                if isinstance(old_doc, dict) else []
         except json.JSONDecodeError:
-            old_doc = None
-        if old_doc is not None and canonical(old_doc) == canonical(new_doc):
-            log(f"in sync: {len(posts)} post(s), no commit needed")
-            return 0
-    elif status == 404:
-        sha = None
-    else:
+            old_posts = []
+    elif status != 404:
         raise SystemExit(f"unexpected GitHub GET status {status}")
+
+    merged = merge_posts(old_posts, posts)
+    new_doc = {"version": 1, "posts": merged}
+    old_doc = {"version": 1, "posts": old_posts} if old_posts else None
+    if old_doc is not None and canonical(old_doc) == canonical(new_doc):
+        log(f"in sync: {len(merged)} post(s), no commit needed")
+        return 0
 
     content = base64.b64encode(
         (json.dumps(new_doc, indent=1, ensure_ascii=False) + "\n")
         .encode("utf-8")).decode()
     payload = {
-        "message": f"forum backup: {len(posts)} post(s)",
+        "message": f"forum backup: {len(merged)} post(s)",
         "content": content,
         "branch": "main",
     }
     if sha:
         payload["sha"] = sha
     status, resp = gh(pat, "PUT", API_URL, payload)
-    log(f"committed forum backup ({len(posts)} post(s)): "
+    log(f"committed forum backup ({len(merged)} post(s)): "
         f"{resp.get('commit', {}).get('sha', '?')[:12]}")
     return 0
 
