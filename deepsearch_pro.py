@@ -77,6 +77,16 @@ X402_DESCRIPTION = (
     "images, news, academic, social, and adult — searched in parallel, "
     "deduplicated and ranked. Returns JSON results.")
 
+# SEC filings lookup (Feature 4) — $0.05 in USDC on Base, via the same
+# PayAI facilitator and the same x402 flow as the search endpoint.
+X402_FILINGS_PRICE_USDC = "0.05"
+X402_FILINGS_AMOUNT = "50000"  # 0.05 USDC = 50000 base units (6 decimals)
+X402_FILINGS_DESCRIPTION = (
+    "SEC filings lookup: clean, structured EDGAR submissions data for "
+    "any public company — company name, tickers, fiscal year end, "
+    "filings by form and month, 8-K item counts, and the latest "
+    "filings. One call, one company, last N years.")
+
 # Summaries (Feature 2) — fetch top result pages, show a short summary.
 SUMMARY_MAX_RESULTS = 5
 SUMMARY_FETCH_TIMEOUT = 8  # seconds per page
@@ -552,6 +562,50 @@ def x402_challenge_b64(base_url: str) -> str:
         json.dumps(payload).encode()).decode()
 
 
+def filings_x402_requirements(base_url: str) -> dict:
+    """Payment terms for one /api/v1/filings call (x402 v2, exact/USDC)."""
+    return {
+        "scheme": "exact",
+        "network": X402_NETWORK,
+        "maxAmountRequired": X402_FILINGS_AMOUNT,
+        "resource": base_url.rstrip("/") + "/api/v1/filings",
+        "description": X402_FILINGS_DESCRIPTION,
+        "mimeType": "application/json",
+        "payTo": X402_PAY_TO,
+        "maxTimeoutSeconds": 300,
+        "asset": X402_ASSET,
+        "extra": {"name": "USD Coin", "version": "2"},
+        "extensions": {
+            "bazaar": {
+                "discoverable": True,
+                "serviceName": "DeepSearch Pro",
+                "tags": ["sec", "edgar", "filings", "finance", "data"],
+                "exampleInput": {"cik": "0000909832", "years": 2},
+                "exampleOutput": {
+                    "company": {"name": "COSTCO WHOLESALE CORP",
+                                "cik": "0000909832",
+                                "tickers": ["COST"],
+                                "fiscalYearEnd": "0831"},
+                    "total_filings_in_range": 120,
+                    "tallies": {"by_form": {"10-K": 2, "10-Q": 8,
+                                            "8-K": 24}}},
+            }
+        },
+    }
+
+
+def filings_x402_challenge_b64(base_url: str) -> str:
+    """Base64 JSON for the PAYMENT-REQUIRED header (x402 v2, filings)."""
+    payload = {
+        "x402Version": 2,
+        "error": ("Payment required: $0.05 USDC on Base per filings "
+                  "lookup."),
+        "accepts": [filings_x402_requirements(base_url)],
+    }
+    return base64.b64encode(
+        json.dumps(payload).encode()).decode()
+
+
 def _facilitator_call(endpoint: str, payload: dict):
     """POST to the PayAI facilitator. Returns (status, parsed_json)."""
     data = json.dumps(payload).encode()
@@ -572,14 +626,15 @@ def _facilitator_call(endpoint: str, payload: dict):
         return 0, {"error": f"facilitator unreachable: {e}"}
 
 
-def x402_verify_and_settle(payment_payload: dict, base_url: str):
+def x402_verify_and_settle(payment_payload: dict, base_url: str,
+                           requirements: dict = None):
     """Verify a payment with the facilitator, then settle it.
 
     Returns (ok, detail_dict). The payment payload comes from the
     client's X-PAYMENT header (base64 JSON). The facilitator does the
     on-chain verification — this server never touches private keys.
     """
-    requirements = x402_requirements(base_url)
+    requirements = requirements or x402_requirements(base_url)
     body = {
         "x402Version": 2,
         "paymentPayload": payment_payload,
@@ -596,6 +651,110 @@ def x402_verify_and_settle(payment_payload: dict, base_url: str):
             or f"settle failed (HTTP {status})"
         return False, {"error": f"Payment settlement failed: {reason}"}
     return True, stl
+
+
+# ------------------------------------------- SEC filings (Feature 4)
+
+SEC_UA = "DeepSearch Pro clio-donvito@muse.ai"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{}.json"
+SEC_FETCH_TIMEOUT = 20
+
+
+def fetch_edgar_submissions(cik_padded: str):
+    """Fetch EDGAR submissions JSON for a 10-digit CIK.
+
+    SEC fair-access rules require a User-Agent identifying the
+    requester; SEC_UA does that. Returns (data_dict, error_str).
+    """
+    url = SEC_SUBMISSIONS_URL.format(cik_padded)
+    req = urllib.request.Request(url, headers={"User-Agent": SEC_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=SEC_FETCH_TIMEOUT) as resp:
+            return json.loads(resp.read().decode()), None
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, f"No EDGAR submissions found for CIK {cik_padded}."
+        return None, f"EDGAR returned HTTP {e.code}."
+    except Exception as e:
+        return None, f"Could not reach EDGAR: {e}"
+
+
+def build_filings_response(data: dict, years: int) -> dict:
+    """Filter EDGAR submissions to the last N years and tally them.
+
+    EDGAR's 'recent' arrays are parallel (accessionNumber, filingDate,
+    reportDate, form, items). 'recent' holds at most the newest 1000
+    filings; if it holds fewer, it is the company's complete history.
+    """
+    cutoff = (datetime.now(timezone.utc)
+              - timedelta(days=365 * years)).date()
+    recent = (data.get("filings") or {}).get("recent") or {}
+    n = len(recent.get("accessionNumber") or [])
+    filings = []
+    for i in range(n):
+        fdate = (recent.get("filingDate") or [""])[i] or ""
+        try:
+            fday = datetime.strptime(fdate, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if fday < cutoff:
+            continue
+        form = (recent.get("form") or [""])[i] or ""
+        items_raw = (recent.get("items") or [""])[i] or ""
+        items = ([s.strip() for s in str(items_raw).split(",")
+                  if s.strip()] if form == "8-K" else [])
+        filings.append({
+            "accessionNumber": (recent.get("accessionNumber") or [""])[i],
+            "filingDate": fdate,
+            "reportDate": (recent.get("reportDate") or [""])[i] or "",
+            "form": form,
+            "items": items,
+        })
+    filings.sort(key=lambda f: (f["filingDate"], f["accessionNumber"]),
+                 reverse=True)
+    by_form = {}
+    by_month = {}
+    by_8k_item = {}
+    for f in filings:
+        by_form[f["form"]] = by_form.get(f["form"], 0) + 1
+        by_month[f["filingDate"][:7]] = \
+            by_month.get(f["filingDate"][:7], 0) + 1
+        for it in f["items"]:
+            by_8k_item[it] = by_8k_item.get(it, 0) + 1
+    dates = [d for d in (recent.get("filingDate") or []) if d]
+    oldest_recent = min(dates) if dates else ""
+    # Complete if recent is the full history (<1000) or the oldest
+    # recent filing predates the cutoff (so every in-window filing is
+    # among the newest 1000). Incomplete only if exactly 1000 recent
+    # filings and the oldest is still inside the window.
+    complete = n < 1000 or (oldest_recent
+                            and oldest_recent < cutoff.isoformat())
+    return {
+        "company": {
+            "name": data.get("name", ""),
+            "cik": str(data.get("cik", "")).zfill(10),
+            "tickers": data.get("tickers") or [],
+            "exchanges": data.get("exchanges") or [],
+            "fiscalYearEnd": data.get("fiscalYearEnd", ""),
+            "sic": data.get("sic", ""),
+            "sicDescription": data.get("sicDescription", ""),
+            "stateOfIncorporation": data.get("stateOfIncorporation", ""),
+        },
+        "years": years,
+        "cutoff_date": cutoff.isoformat(),
+        "total_filings_in_range": len(filings),
+        "total_filings_all_time": n,
+        "complete": complete,
+        "filings": filings,
+        "latest_10": filings[:10],
+        "tallies": {
+            "by_form": dict(sorted(by_form.items(),
+                                   key=lambda kv: -kv[1])),
+            "by_month": dict(sorted(by_month.items())),
+            "by_8k_item": dict(sorted(by_8k_item.items(),
+                                      key=lambda kv: -kv[1])),
+        },
+    }
 
 
 # ---------------------------------------------- summaries (Feature 2)
@@ -1110,6 +1269,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/search":
             self._handle_v1_search(params)
             return
+        if path == "/api/v1/filings":
+            self._handle_v1_filings(params)
+            return
         if path == "/openapi.json":
             self._serve_openapi()
             return
@@ -1117,6 +1279,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"status": "ok", "service": "deepsearch-pro",
                              "engines": 186,
                              "x402_price_usdc": X402_PRICE_USDC,
+                             "x402_filings_price_usdc":
+                                 X402_FILINGS_PRICE_USDC,
                              "x402_network": X402_NETWORK,
                              "x402_pay_to": X402_PAY_TO})
             return
@@ -1432,20 +1596,27 @@ class Handler(BaseHTTPRequestHandler):
         """
         base_url = self._base_url().rstrip("/")
         resource_url = base_url + "/api/v1/search"
+        filings_url = base_url + "/api/v1/filings"
         doc = {
             "x402Version": 2,
             "version": 1,
             "name": "DeepSearch Pro",
             "description": X402_DESCRIPTION,
             "url": base_url,
-            "resources": [resource_url],
+            "resources": [resource_url, filings_url],
             "endpoints": [
                 {
                     "url": resource_url,
                     "method": "GET",
                     "description": X402_DESCRIPTION,
                     "accepts": [x402_requirements(base_url)],
-                }
+                },
+                {
+                    "url": filings_url,
+                    "method": "GET",
+                    "description": X402_FILINGS_DESCRIPTION,
+                    "accepts": [filings_x402_requirements(base_url)],
+                },
             ],
         }
         self._send_json(doc)
@@ -1471,6 +1642,11 @@ class Handler(BaseHTTPRequestHandler):
             " &summarize=1 for a short summary of each top result."
             " Categories: all, web, video, images, academic, news,"
             " social, adult.\n"
+            f"- [SEC filings lookup API]({base}/api/v1/filings): GET"
+            " /api/v1/filings?cik=...&years=2 — clean EDGAR submissions"
+            " data: company, tickers, fiscal year end, filings by form"
+            " and month, 8-K item counts, latest filings. $0.05 USDC"
+            " on Base per call via x402; unpaid requests get HTTP 402.\n"
             f"- [OpenAPI spec]({base}/openapi.json): full spec with"
             " x-payment-info on the paid operation.\n"
             f"- [Discovery manifest]({base}/.well-known/x402.json):"
@@ -1511,7 +1687,18 @@ class Handler(BaseHTTPRequestHandler):
                     "asset": X402_ASSET,
                     "payTo": X402_PAY_TO,
                     "facilitator": X402_FACILITATOR,
-                }
+                },
+                {
+                    "path": "/api/v1/filings",
+                    "url": base + "/api/v1/filings",
+                    "method": "GET",
+                    "description": X402_FILINGS_DESCRIPTION,
+                    "price_usdc": X402_FILINGS_PRICE_USDC,
+                    "network": X402_NETWORK,
+                    "asset": X402_ASSET,
+                    "payTo": X402_PAY_TO,
+                    "facilitator": X402_FACILITATOR,
+                },
             ],
             "payment": {
                 "protocol": "x402",
@@ -1568,6 +1755,91 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_402_filings(self, base_url: str):
+        """x402 v2 challenge for /api/v1/filings: 402 + PAYMENT-REQUIRED."""
+        challenge = filings_x402_challenge_b64(base_url)
+        body = json.dumps({
+            "error": "Payment required",
+            "message": ("This endpoint costs $0.05 USDC on Base per "
+                        "filings lookup, paid via x402. Send an X-PAYMENT "
+                        "header or use an API key (?key= / X-API-Key)."),
+            "x402Version": 2,
+            "accepts": [filings_x402_requirements(base_url)],
+        }).encode()
+        self.send_response(402)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("PAYMENT-REQUIRED", challenge)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_v1_filings(self, params):
+        # Auth FIRST, input validation second — same as _handle_v1_search:
+        # an unpaid request to the bare URL gets the 402 challenge, not
+        # a 400. Directory health checks probe the bare URL and expect 402.
+        key = (params.get("key", [""])[0]
+               or self.headers.get("X-API-Key", ""))
+        user = get_user_by_api_key(key) if key else None
+        if user:
+            allowed, msg = can_api_call(user)
+            if not allowed:
+                self._send_json({"error": msg}, status=429)
+                return
+            record_api_call(user["id"])
+        else:
+            payment_header = self.headers.get("X-PAYMENT", "")
+            if not payment_header:
+                self._send_402_filings(self._base_url())
+                return
+            try:
+                payment_payload = json.loads(
+                    base64.b64decode(payment_header).decode())
+            except Exception:
+                self._send_402_filings(self._base_url())
+                return
+            ok, detail = x402_verify_and_settle(
+                payment_payload, self._base_url(),
+                filings_x402_requirements(self._base_url()))
+            if not ok:
+                self._send_json(detail, status=402)
+                return
+            settle_b64 = base64.b64encode(
+                json.dumps(detail).encode()).decode()
+            self._v1_payment_response = settle_b64
+
+        cik_raw = params.get("cik", [""])[0].strip()
+        if not cik_raw or not cik_raw.isdigit() or len(cik_raw) > 10:
+            self._send_json(
+                {"error": "Missing or invalid ?cik= parameter. Give the "
+                          "company's SEC CIK (digits, up to 10, e.g. "
+                          "0000909832 for Costco)."}, status=400)
+            return
+        cik = cik_raw.zfill(10)
+        try:
+            years = int(params.get("years", ["2"])[0] or 2)
+        except ValueError:
+            years = 2
+        years = max(1, min(years, 10))
+
+        data, err = fetch_edgar_submissions(cik)
+        if err:
+            status = 404 if "No EDGAR submissions" in err else 502
+            self._send_json({"error": err}, status=status)
+            return
+        payload = build_filings_response(data, years)
+        payload["paid_via"] = "api_key" if user else "x402"
+        payload["price_usdc"] = ("0.00" if user
+                                 else X402_FILINGS_PRICE_USDC)
+        data_out = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data_out)))
+        if not user and getattr(self, "_v1_payment_response", None):
+            self.send_header("X-PAYMENT-RESPONSE",
+                             self._v1_payment_response)
+        self.end_headers()
+        self.wfile.write(data_out)
 
     def _base_url(self) -> str:
         host = self.headers.get("Host", "deepsearch-pro.onrender.com")
@@ -1704,6 +1976,37 @@ class Handler(BaseHTTPRequestHandler):
                             "200": {"description": "Search results."},
                             "402": {"description": "Payment required (x402)."},
                             "400": {"description": "Missing/invalid param."},
+                        },
+                    }
+                },
+                "/api/v1/filings": {
+                    "get": {
+                        "summary": "SEC filings lookup (pay-per-call)",
+                        "description": X402_FILINGS_DESCRIPTION,
+                        "x-payment-info": {
+                            "scheme": "exact",
+                            "network": X402_NETWORK,
+                            "price": f"${X402_FILINGS_PRICE_USDC}",
+                            "asset": "USDC",
+                            "payTo": X402_PAY_TO,
+                        },
+                        "parameters": [
+                            {"name": "cik", "in": "query", "required": True,
+                             "schema": {"type": "string"},
+                             "description": "Company CIK, digits up to 10"
+                                            " (e.g. 0000909832 for"
+                                            " Costco)."},
+                            {"name": "years", "in": "query",
+                             "schema": {"type": "integer", "default": 2},
+                             "description": "Years of filings to include"
+                                            " (1-10, default 2)."},
+                        ],
+                        "responses": {
+                            "200": {"description": "Filings data."},
+                            "402": {"description": "Payment required (x402)."},
+                            "400": {"description": "Missing/invalid param."},
+                            "404": {"description": "CIK not found in EDGAR."},
+                            "502": {"description": "EDGAR unreachable."},
                         },
                     }
                 }
