@@ -23,6 +23,9 @@ Sessions: random tokens in SQLite, 7-day expiry, HttpOnly cookies.
 API keys: random tokens per user, sent as ?key= or X-API-Key header.
 
 Storage: SQLite (deepsearch_pro.db) — users, sessions, daily usage.
+Forum posts are durable: backed up to forum/posts.json in this repo
+(home-server sync job reads /forum/feed.json) and restored on a
+fresh database, so a Render restart/redeploy no longer eats them.
 No external dependencies — stdlib only, like the original.
 
 Run:  python3 deepsearch_pro.py          (port 8091 by default)
@@ -135,6 +138,19 @@ SUMMARY_CATEGORIES = {"web", "academic", "news", "social", "all"}
 FORUM_CATEGORIES = ["finding", "tool", "tip", "question", "bounty",
                     "idea", "languages"]
 
+# Forum durability — Render's free tier wipes SQLite on every restart /
+# redeploy, so forum posts are backed up to the repo itself:
+# forum/posts.json (public, versioned). On a fresh/empty database the
+# app restores posts from that file first and only seeds the welcome
+# post when no backup exists. A small sync job on the home server
+# (forum-sync.py, every 5 min) pulls /forum/feed.json and commits any
+# new posts to the repo. Views stay SQLite-only (losing them is fine).
+# FORUM_BACKUP_URL can point at a file:// URL for local testing.
+FORUM_BACKUP_URL = os.environ.get(
+    "FORUM_BACKUP_URL",
+    "https://raw.githubusercontent.com/cliodonvito/deepsearch-pro/main/forum/posts.json")
+FORUM_BACKUP_TIMEOUT = 10  # seconds; a failed/slow fetch never blocks startup
+
 FREE_DAILY_LIMIT = 50
 API_MONTHLY_LIMIT = 10000
 SESSION_DAYS = 7
@@ -228,12 +244,19 @@ def init_db():
             ON video_jobs(status, created_at);
     """)
     db.commit()
-    # Seed the forum's first post (only on a fresh/empty database).
-    # Render's free-tier SQLite is ephemeral, so this re-seeds on every
+    # Seed the forum's first post (only on a fresh/empty database with
+    # no backup to restore from). Render's free-tier SQLite is
+    # ephemeral, so without the repo backup this re-seeds on every
     # fresh deploy — the languages category always starts with a real
     # conversation, not an empty page.
     try:
         count = db.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+        if count == 0:
+            # Restore from the repo backup first (own connection,
+            # commits itself); only seed if nothing came back.
+            restore_posts_from_backup()
+            count = db.execute(
+                "SELECT COUNT(*) FROM posts").fetchone()[0]
         if count == 0:
             db.execute(
                 "INSERT INTO posts (user_id, author, title, body,"
@@ -560,6 +583,94 @@ def forum_counts() -> dict:
     db.close()
     return {"total": total,
             "by_category": {r[0]: r[1] for r in by_cat}}
+
+
+def forum_feed() -> list:
+    """All posts, oldest id first, for the backup feed / sync job."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, user_id, author, title, body, category, views,"
+        " created_at FROM posts ORDER BY id ASC").fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+
+def restore_posts_from_backup(url: str = FORUM_BACKUP_URL) -> int:
+    """Restore posts from the repo backup file into an empty posts table.
+
+    Returns the number of posts restored (0 when the table is not
+    empty, the backup is missing, or the fetch fails). Never raises —
+    a failed restore must never take the service down; init_db falls
+    back to the seed post instead.
+    """
+    db = get_db()
+    try:
+        count = db.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+        if count != 0:
+            return 0
+    except sqlite3.Error:
+        return 0
+    finally:
+        db.close()
+    try:
+        if url.startswith("file://"):
+            with open(urllib.parse.urlparse(url).path,
+                      encoding="utf-8") as f:
+                payload = json.load(f)
+        else:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "DeepSearchPro-forum-restore/1.0"})
+            with urllib.request.urlopen(
+                    req, timeout=FORUM_BACKUP_TIMEOUT) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        print(f"forum restore: backup fetch failed ({e}); seeding instead",
+              flush=True)
+        return 0
+    posts = payload.get("posts") if isinstance(payload, dict) else payload
+    if not isinstance(posts, list):
+        print("forum restore: backup is not a post list; seeding instead",
+              flush=True)
+        return 0
+    db = get_db()
+    restored = 0
+    try:
+        for p in posts:
+            if not isinstance(p, dict):
+                continue
+            try:
+                post_id = int(p["id"])
+                title = str(p["title"]).strip()
+                body = str(p["body"]).strip()
+                author = str(p.get("author") or "anonymous")[:40]
+                category = str(p.get("category") or "finding")
+                created = str(p.get("created_at") or
+                              datetime.now(timezone.utc).isoformat())
+                user_id = int(p.get("user_id") or 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if category not in FORUM_CATEGORIES:
+                category = "finding"
+            if len(title) < 3 or len(body) < 10:
+                continue
+            cur = db.execute(
+                "INSERT OR IGNORE INTO posts (id, user_id, author,"
+                " title, body, category, views, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+                (post_id, user_id, author, title, body, category,
+                 created))
+            if cur.rowcount:
+                restored += 1
+        db.commit()
+    except sqlite3.Error as e:
+        print(f"forum restore: insert failed ({e})", flush=True)
+        restored = 0
+    finally:
+        db.close()
+    if restored:
+        print(f"forum restore: {restored} post(s) restored from backup",
+              flush=True)
+    return restored
 
 
 # ------------------------------------------------------- x402 (Feature 1)
@@ -1751,6 +1862,9 @@ class Handler(BaseHTTPRequestHandler):
             # in the app directory; see _serve_well_known_txt.
             self._serve_well_known_txt(path)
             return
+        if path == "/forum/feed.json":
+            self._serve_forum_feed()
+            return
         if path == "/forum":
             self._serve_forum(params, user)
             return
@@ -1926,6 +2040,15 @@ class Handler(BaseHTTPRequestHandler):
         self._send_html(body)
 
     # -- forum handlers (Feature 3) ---------------------------------
+    def _serve_forum_feed(self):
+        """Public JSON feed of all forum posts (id order) — the backup
+        sync job reads this; posts are public to read anyway."""
+        try:
+            posts = forum_feed()
+        except Exception:
+            posts = []
+        self._send_json({"version": 1, "posts": posts})
+
     def _serve_forum(self, params, user):
         category = params.get("cat", [""])[0]
         sort = params.get("sort", ["newest"])[0]

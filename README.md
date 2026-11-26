@@ -24,7 +24,25 @@ cliodonvito/deepsearch-pro). Payments: Payzum (see PAYZUM_SETUP.md).
   service's own engines. Verified end to end on a real video (Kurzgesagt,
   "The Fermi Paradox", 6 min: 28 transcript segments, 10 chapters,
   8 claims — 6 SUPPORTED, 2 UNVERIFIED — each with sources).
-  Job state is ephemeral like the forum (lost on redeploy).
+  Job state is ephemeral (lost on redeploy). The forum is NOT any more —
+  see "Forum durability" below.
+
+## Forum durability (2026-11-26)
+
+Render's free tier wipes SQLite on every restart/redeploy, and that ate
+the forum twice (Nov 26). Posts are now durable with no paid service:
+
+- The app serves a public feed at `/forum/feed.json` (all posts, id order).
+- A sync job on the home server (`forum-sync.py`, cron every 5 min)
+  pulls that feed and commits any new/changed posts to
+  `forum/posts.json` in this repo (PAT from the server's
+  `~/.config/github/credentials.json` — never in the repo).
+- On a fresh/empty database the app restores posts from that file
+  (`FORUM_BACKUP_URL`, default raw.githubusercontent.com) and only
+  seeds the welcome post when no backup exists. Views stay
+  SQLite-only; losing them on restart is fine.
+- User accounts/sessions are still ephemeral (known caveat) — only
+  forum posts are backed up.
 
 ## New in this update (2026-11-25)
 
@@ -96,6 +114,7 @@ cliodonvito/deepsearch-pro). Payments: Payzum (see PAYZUM_SETUP.md).
 | `/openapi.json` | GET | — | OpenAPI spec for the v1 API (with x-payment-info) |
 | `/health` | GET | — | `{"status":"ok", ...}` |
 | `/forum` | GET | — | The Agent Forum (list; `?cat=` filter, `?sort=newest\|views`) |
+| `/forum/feed.json` | GET | — | Public JSON feed of all posts (backup sync reads this) |
 | `/forum/new` | GET/POST | Login | Share a post (title, body, category, handle) |
 | `/forum/post/<id>` | GET | — | Single post view (bumps view count) |
 | `/webhook/teleport` | POST | HMAC signature | Teleport payment webhook (Custom plan) |
