@@ -76,6 +76,15 @@ def canonical(doc):
     return json.dumps(doc, sort_keys=True, ensure_ascii=False)
 
 
+def strip_views(posts):
+    """Drop the views counter: views live in SQLite only (the app
+    bumps them on every post view, and restore inserts 0). Comparing
+    them would make every view look like a change and commit a new
+    backup every 5 minutes."""
+    return [{k: v for k, v in p.items() if k != "views"}
+            for p in posts if isinstance(p, dict)]
+
+
 def merge_posts(old_posts, live_posts):
     """Union by id; the live feed wins on a tie (no edit feature
     exists, so ties only differ in views). Crucially, posts the live
@@ -110,7 +119,8 @@ def main():
     elif status != 404:
         raise SystemExit(f"unexpected GitHub GET status {status}")
 
-    merged = merge_posts(old_posts, posts)
+    merged = merge_posts(strip_views(old_posts),
+                         strip_views(posts))
     new_doc = {"version": 1, "posts": merged}
     old_doc = {"version": 1, "posts": old_posts} if old_posts else None
     if old_doc is not None and canonical(old_doc) == canonical(new_doc):
