@@ -52,6 +52,18 @@ from search_engines import (search_all, VIDEO_ENGINES, IMAGE_ENGINES,
                             WEB_ENGINES, ACADEMIC_ENGINES, NEWS_ENGINES,
                             SOCIAL_ENGINES, ADULT_ENGINES, OBSCURE_ENGINES)
 
+# Worker auth for the learning video layer (Feature 5). video_auth.py
+# verifies Ed25519 signatures from the home-server transcript worker
+# (ed25519.py is the pure-Python implementation from the Axiom-0
+# skeleton). If the module is missing, the app still starts — the
+# worker endpoints answer 503 instead of taking the whole service down.
+try:
+    import video_auth
+    _VIDEO_AUTH_OK = True
+except Exception:
+    video_auth = None
+    _VIDEO_AUTH_OK = False
+
 PORT = int(os.environ.get("PORT", "8091"))
 DB_PATH = os.environ.get("DB_PATH", os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "deepsearch_pro.db"))
@@ -86,6 +98,30 @@ X402_FILINGS_DESCRIPTION = (
     "any public company — company name, tickers, fiscal year end, "
     "filings by form and month, 8-K item counts, and the latest "
     "filings. One call, one company, last N years.")
+
+# Learning video layer (Feature 5) — $0.10 per video in USDC on Base,
+# via the same PayAI facilitator and the same x402 flow as the search
+# and filings endpoints. Paste a YouTube URL, get the full timestamped
+# transcript, a summary with chapters, and every verifiable claim
+# checked against sources (SUPPORTED / CONTRADICTED / UNVERIFIED).
+# The work runs on the home server (residential IP — YouTube blocks
+# caption fetches from datacenter IPs): a worker there polls a job
+# queue on this service over outbound HTTPS and posts results back.
+# The home server is never exposed to the internet — no inbound port,
+# no public URL for it, ever. Ad-free playback is explicitly OUT of
+# scope: we do the learning, the user's own blocker (Firefox +
+# uBlock Origin) or YouTube Premium does the blocking.
+X402_VIDEO_PRICE_USDC = "0.10"
+X402_VIDEO_AMOUNT = "100000"  # 0.10 USDC = 100000 base units (6 decimals)
+X402_VIDEO_DESCRIPTION = (
+    "Learning video layer: paste a YouTube URL, get the full "
+    "timestamped transcript, a summary with chapters, and every "
+    "verifiable claim checked against sources — SUPPORTED, "
+    "CONTRADICTED, or UNVERIFIED, each with links and the timestamp "
+    "in the video. One call, one video, $0.10 USDC on Base via x402.")
+VIDEO_CLAIM_LEASE_SECONDS = 1800  # 30 min: a claimed job that is not
+# completed within this long returns to the pending queue.
+VIDEO_MAX_CLAIMS = 8  # claims checked per video (worker-side cap)
 
 # Summaries (Feature 2) — fetch top result pages, show a short summary.
 SUMMARY_MAX_RESULTS = 5
@@ -172,6 +208,24 @@ def init_db():
             ON posts(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_posts_category
             ON posts(category);
+        CREATE TABLE IF NOT EXISTS video_jobs (
+            id TEXT PRIMARY KEY,
+            video_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            claimed_at TEXT,
+            paid_via TEXT NOT NULL DEFAULT '',
+            price_usdc TEXT NOT NULL DEFAULT '0.10',
+            transcript TEXT,
+            summary TEXT,
+            chapters TEXT,
+            claims TEXT,
+            error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_video_jobs_status
+            ON video_jobs(status, created_at);
     """)
     db.commit()
     # Seed the forum's first post (only on a fresh/empty database).
@@ -757,6 +811,234 @@ def build_filings_response(data: dict, years: int) -> dict:
     }
 
 
+# -------------------------------------- learning video layer (Feature 5)
+
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com",
+                 "music.youtube.com", "youtube-nocookie.com",
+                 "www.youtube-nocookie.com", "youtu.be"}
+YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+YOUTUBE_OEMBED_URL = ("https://www.youtube.com/oembed?url="
+                      "https://www.youtube.com/watch?v={}&format=json")
+YOUTUBE_OEMBED_TIMEOUT = 10
+YOUTUBE_OEMBED_UA = "DeepSearch Pro clio-donvito@muse.ai"
+
+
+def parse_youtube_url(url: str):
+    """Extract the 11-char video id from a YouTube URL.
+
+    Accepts watch, youtu.be, shorts, embed, /v/ and music links.
+    Returns (video_id, error); error is None on success.
+    """
+    if not url or not isinstance(url, str):
+        return None, "Missing 'url' — give a YouTube video URL."
+    url = url.strip()
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return None, f"Not a valid URL: {url[:80]}"
+    host = (parsed.netloc or "").lower().split(":")[0]
+    if host not in YOUTUBE_HOSTS:
+        return None, ("Not a YouTube URL. Give a youtube.com or "
+                      "youtu.be link.")
+    video_id = ""
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/")[0]
+    elif parsed.path in ("/watch", "/v/") or \
+            parsed.path.startswith("/watch"):
+        video_id = (urllib.parse.parse_qs(parsed.query)
+                    .get("v", [""])[0])
+    elif parsed.path.startswith(("/shorts/", "/embed/",
+                                 "/live/", "/v/")):
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2:
+            video_id = parts[1]
+    if not video_id or not YOUTUBE_ID_RE.match(video_id):
+        return None, ("Could not find a video id in that URL. Give a "
+                      "full YouTube watch link, e.g. "
+                      "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    return video_id, None
+
+
+def fetch_youtube_oembed(video_id: str):
+    """Check a video exists via YouTube's oEmbed endpoint (no key).
+
+    Returns (title, author, status) with status one of "ok"
+    (video exists), "unknown" (oEmbed says 404/401 — private, deleted
+    or never existed), "unreachable" (network error — the caller
+    should accept the job and let the worker decide, rather than
+    failing a possibly-good video on a transient error).
+    """
+    req = urllib.request.Request(
+        YOUTUBE_OEMBED_URL.format(video_id),
+        headers={"User-Agent": YOUTUBE_OEMBED_UA})
+    try:
+        with urllib.request.urlopen(req,
+                                    timeout=YOUTUBE_OEMBED_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode())
+            return (data.get("title", ""), data.get("author_name", ""),
+                    "ok")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 404):
+            return "", "", "unknown"
+        return "", "", "unreachable"
+    except Exception:
+        return "", "", "unreachable"
+
+
+def create_video_job(video_id: str, url: str, title: str,
+                     paid_via: str, price_usdc: str) -> str:
+    """Insert a pending video job. Returns the job id."""
+    job_id = "vj_" + secrets.token_hex(12)
+    db = get_db()
+    db.execute(
+        "INSERT INTO video_jobs (id, video_id, url, title, status,"
+        " created_at, paid_via, price_usdc) VALUES (?, ?, ?, ?,"
+        " 'pending', ?, ?, ?)",
+        (job_id, video_id, url, title,
+         datetime.now(timezone.utc).isoformat(), paid_via, price_usdc))
+    db.commit()
+    db.close()
+    return job_id
+
+
+def get_video_job(job_id: str):
+    db = get_db()
+    row = db.execute("SELECT * FROM video_jobs WHERE id = ?",
+                     (job_id,)).fetchone()
+    db.close()
+    return row
+
+
+def claim_next_video_job():
+    """Claim the oldest pending video job for the worker.
+
+    A job claimed more than VIDEO_CLAIM_LEASE_SECONDS ago without a
+    result is treated as abandoned and re-claimed. Returns the row or
+    None when the queue is empty.
+    """
+    now = datetime.now(timezone.utc)
+    lease_ago = (now - timedelta(
+        seconds=VIDEO_CLAIM_LEASE_SECONDS)).isoformat()
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM video_jobs WHERE status = 'pending' OR"
+        " (status = 'claimed' AND claimed_at IS NOT NULL AND"
+        " claimed_at < ?) ORDER BY created_at ASC LIMIT 1",
+        (lease_ago,)).fetchone()
+    if row:
+        db.execute(
+            "UPDATE video_jobs SET status = 'claimed', claimed_at = ?"
+            " WHERE id = ?",
+            (now.isoformat(), row["id"]))
+        db.commit()
+    db.close()
+    return row
+
+
+def complete_video_job(job_id: str, result: dict) -> bool:
+    """Store a worker result. Only a claimed job can complete."""
+    db = get_db()
+    cur = db.execute(
+        "UPDATE video_jobs SET status = 'done', transcript = ?,"
+        " summary = ?, chapters = ?, claims = ? WHERE id = ?"
+        " AND status = 'claimed'",
+        (json.dumps(result.get("transcript") or {}),
+         result.get("summary") or "",
+         json.dumps(result.get("chapters") or []),
+         json.dumps(result.get("claims") or []), job_id))
+    db.commit()
+    changed = cur.rowcount > 0
+    db.close()
+    return changed
+
+
+def fail_video_job(job_id: str, error: str) -> bool:
+    """Mark a claimed job failed with the worker's error message."""
+    db = get_db()
+    cur = db.execute(
+        "UPDATE video_jobs SET status = 'failed', error = ?"
+        " WHERE id = ? AND status = 'claimed'",
+        (error[:500], job_id))
+    db.commit()
+    changed = cur.rowcount > 0
+    db.close()
+    return changed
+
+
+def video_job_to_dict(row) -> dict:
+    """Public view of a video job row (result fields parsed)."""
+    out = {
+        "job_id": row["id"],
+        "video_id": row["video_id"],
+        "url": row["url"],
+        "title": row["title"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "paid_via": row["paid_via"],
+        "price_usdc": row["price_usdc"],
+    }
+    if row["status"] == "done":
+        try:
+            out["transcript"] = json.loads(row["transcript"] or "{}")
+        except (ValueError, TypeError):
+            out["transcript"] = {}
+        out["summary"] = row["summary"] or ""
+        try:
+            out["chapters"] = json.loads(row["chapters"] or "[]")
+        except (ValueError, TypeError):
+            out["chapters"] = []
+        try:
+            out["claims"] = json.loads(row["claims"] or "[]")
+        except (ValueError, TypeError):
+            out["claims"] = []
+    if row["status"] == "failed":
+        out["error"] = row["error"] or "Worker failed without a reason."
+    return out
+
+
+def video_x402_requirements(base_url: str) -> dict:
+    """Payment terms for one /api/v1/video call (x402 v2, exact/USDC)."""
+    return {
+        "scheme": "exact",
+        "network": X402_NETWORK,
+        "maxAmountRequired": X402_VIDEO_AMOUNT,
+        "resource": base_url.rstrip("/") + "/api/v1/video",
+        "description": X402_VIDEO_DESCRIPTION,
+        "mimeType": "application/json",
+        "payTo": X402_PAY_TO,
+        "maxTimeoutSeconds": 300,
+        "asset": X402_ASSET,
+        "extra": {"name": "USD Coin", "version": "2"},
+        "extensions": {
+            "bazaar": {
+                "discoverable": True,
+                "serviceName": "DeepSearch Pro",
+                "tags": ["video", "youtube", "transcript", "summary",
+                         "fact-check", "learning"],
+                "exampleInput": {
+                    "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+                "exampleOutput": {
+                    "job_id": "vj_0123456789abcdef01234567",
+                    "status": "pending",
+                    "result_url": "/api/v1/video/jobs/"
+                                  "vj_0123456789abcdef01234567"},
+            }
+        },
+    }
+
+
+def video_x402_challenge_b64(base_url: str) -> str:
+    """Base64 JSON for the PAYMENT-REQUIRED header (x402 v2, video)."""
+    payload = {
+        "x402Version": 2,
+        "error": ("Payment required: $0.10 USDC on Base per video "
+                  "analysis."),
+        "accepts": [video_x402_requirements(base_url)],
+    }
+    return base64.b64encode(
+        json.dumps(payload).encode()).decode()
+
+
 # ---------------------------------------------- summaries (Feature 2)
 
 _SUMMARY_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -1162,6 +1444,148 @@ placeholder="What is it, where did you find it, why is it useful? Links welcome.
 </div>
 </body></html>"""
 
+VIDEO_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Learn from a video — DeepSearch Pro</title>
+<style>
+""" + BASE_CSS + """
+.form-box{max-width:720px;margin:40px auto}
+.claim{border:1px solid #333;border-radius:8px;padding:12px;margin:12px 0}
+.verdict{display:inline-block;padding:2px 10px;border-radius:10px;
+font-size:.8em;font-weight:bold}
+.v-supported{background:#1d3a1d;color:#9ed49e}
+.v-contradicted{background:#3a1d1d;color:#ff9a9a}
+.v-unverified{background:#3a3013;color:#e8c96a}
+.claim .srcs{font-size:.85em;color:#888;margin-top:6px}
+.claim .srcs a{display:block;word-break:break-all}
+.chapter{margin:6px 0;color:#bbb}
+.transcript{white-space:pre-wrap;background:#1a1a1a;border:1px solid #333;
+border-radius:8px;padding:12px;max-height:300px;overflow:auto;
+font-size:.92em;color:#ccc}
+details{margin:14px 0}
+summary{cursor:pointer;color:#d4a94e}
+#x402box{display:none;background:#16261a;border:1px solid #2c4a2c;
+border-radius:8px;padding:12px;margin:12px 0}
+#x402box code{word-break:break-all}
+</style></head><body>
+<div class="nav">{nav}</div>
+<div class="form-box">
+<h1>Learn from a video</h1>
+<p style="color:#bbb">Paste a YouTube URL. You get back the full
+timestamped transcript, a summary with chapters, and every verifiable
+claim in the video checked against sources — <b>SUPPORTED</b>,
+<b>CONTRADICTED</b>, or <b>UNVERIFIED</b>, each with links and the
+timestamp so you can check the moment yourself. Never a bare
+true/false: a sourced "unverified" is the honest answer when the
+evidence is not there.</p>
+<p style="color:#bbb"><b>$0.10 USDC on Base per video</b>, paid via
+x402 — no signup, no key. API-tier members can paste their key below
+instead and the call is free (counts toward the monthly limit).</p>
+<p style="color:#e8c96a"><b>We do the learning, not the blocking.</b>
+This service does not remove ads, strip streams, or play videos
+ad-free. For ad-free playback, use Firefox + uBlock Origin (free) or
+YouTube Premium — they do the blocking, we do the learning.</p>
+<div id="formbox">
+<label>YouTube URL</label>
+<input type="text" id="url" placeholder="https://www.youtube.com/watch?v=..." autofocus>
+<label>API key (optional — API tier only, leave blank to pay $0.10 via x402)</label>
+<input type="text" id="apikey" placeholder="dsp_...">
+<button id="submit" type="button">Analyze this video — $0.10</button>
+<div id="x402box"></div>
+<div id="status"></div>
+</div>
+<div id="result"></div>
+<p class="note" style="color:#777;font-size:.85em">Processing takes a
+few minutes — the transcript is fetched and the claims are checked
+one by one. This page polls for your result. Job state lives in this
+service's free-tier store: if the service restarts before your job
+finishes, the job is lost. Videos over 60 minutes are not accepted.</p>
+<p><a href="/">← Back to search</a></p>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const API = "";
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function ts(sec){sec=Math.max(0,Math.round(sec||0));
+  const h=Math.floor(sec/3600),m=Math.floor(sec%3600/60),s=sec%60;
+  return (h?h+":":"")+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0");}
+function verdictBadge(v){
+  const cls=v==="SUPPORTED"?"v-supported":v==="CONTRADICTED"?"v-contradicted":"v-unverified";
+  return '<span class="verdict '+cls+'">'+esc(v)+'</span>';}
+function renderResult(job){
+  let h='<h2>'+esc(job.title||job.video_id)+'</h2>';
+  h+='<p><a target="_blank" rel="noopener" href="'+esc(job.url)+'">Watch on YouTube</a></p>';
+  if(job.summary){h+='<h3>Summary</h3><p>'+esc(job.summary)+'</p>';}
+  if(job.chapters&&job.chapters.length){
+    h+='<h3>Chapters</h3>';
+    job.chapters.forEach(c=>{h+='<div class="chapter"><a target="_blank" rel="noopener" href="'+esc(job.url)+
+      (job.url.includes("?")?"&":"?")+'t='+Math.round(c.start||0)+'">'+ts(c.start||0)+'</a> — '+esc(c.title||"")+'</div>';});}
+  if(job.claims&&job.claims.length){
+    h+='<h3>Claims checked ('+job.claims.length+')</h3>';
+    job.claims.forEach(cl=>{
+      h+='<div class="claim">'+verdictBadge(cl.verdict||"UNVERIFIED")+
+        ' <a target="_blank" rel="noopener" href="'+esc(job.url)+
+        (job.url.includes("?")?"&":"?")+'t='+Math.round(cl.timestamp||0)+'">'+ts(cl.timestamp||0)+'</a>'+
+        '<p>'+esc(cl.claim||"")+'</p>';
+      if(cl.reason){h+='<p style="color:#bbb">'+esc(cl.reason)+'</p>';}
+      if(cl.sources&&cl.sources.length){
+        h+='<div class="srcs">Sources:';
+        cl.sources.forEach(s=>{h+='<a target="_blank" rel="noopener" href="'+esc(s.url||"")+'">'+esc(s.title||s.url||"")+'</a>';});
+        h+='</div>';}
+      h+='</div>';});}
+  if(job.transcript&&job.transcript.segments&&job.transcript.segments.length){
+    h+='<h3>Transcript</h3><details><summary>Show full transcript ('+job.transcript.segments.length+' segments)</summary><div class="transcript">';
+    job.transcript.segments.forEach(sg=>{h+=esc(ts(sg.start))+'  '+esc(sg.text)+'\\n';});
+    h+='</div></details>';}
+  return h;}
+let timer=null;
+async function poll(jobId){
+  const r=await fetch(API+"/api/v1/video/jobs/"+jobId);
+  const job=await r.json();
+  if(job.status==="done"){
+    clearInterval(timer);
+    $("status").innerHTML='<div class="info">Done.</div>';
+    $("result").innerHTML=renderResult(job);
+  }else if(job.status==="failed"){
+    clearInterval(timer);
+    $("status").innerHTML='<div class="error">Failed: '+esc(job.error||"unknown error")+'</div>';
+  }else{
+    $("status").innerHTML='<div class="info">Status: '+esc(job.status)+' — checking again in 15s… (job '+esc(jobId)+')</div>';}}
+$("submit").onclick=async ()=>{
+  const url=$("url").value.trim();
+  const key=$("apikey").value.trim();
+  if(!url){$("status").innerHTML='<div class="error">Paste a YouTube URL first.</div>';return;}
+  $("status").innerHTML='<div class="info">Submitting…</div>';
+  $("result").innerHTML="";$("x402box").style.display="none";
+  let endpoint=API+"/api/v1/video"+(key?"?key="+encodeURIComponent(key):"");
+  let r;
+  try{
+    r=await fetch(endpoint,{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({url:url})});
+  }catch(e){$("status").innerHTML='<div class="error">Could not reach the service: '+esc(e.message)+'</div>';return;}
+  const data=await r.json().catch(()=>({}));
+  if(r.status===202&&data.job_id){
+    $("status").innerHTML='<div class="info">Job '+esc(data.job_id)+' created — processing…</div>';
+    poll(data.job_id);
+    timer=setInterval(()=>poll(data.job_id),15000);
+  }else if(r.status===402&&data.accepts&&data.accepts[0]){
+    const a=data.accepts[0];
+    $("x402box").style.display="block";
+    $("x402box").innerHTML='<b>Payment required — $0.10 USDC on Base.</b><br>'+
+      'This page cannot pay from a browser on its own: paying needs an x402-compatible wallet or client. '+
+      'Agents can call the API directly: send an <code>X-PAYMENT</code> header built from these terms, '+
+      'or paste an API-tier key above.<br><br>'+
+      'Pay to: <code>'+esc(a.payTo)+'</code><br>'+
+      'Amount: <code>'+esc(a.maxAmountRequired)+'</code> base units of <code>'+esc(a.asset)+'</code><br>'+
+      'Network: <code>'+esc(a.network)+'</code> &nbsp; Resource: <code>'+esc(a.resource)+'</code><br><br>'+
+      '<code>curl -X POST '+esc(location.origin)+'/api/v1/video -H "X-PAYMENT: &lt;base64 payment&gt;" -H "Content-Type: application/json" -d \'{"url":"'+esc(url)+'"}\'</code>';
+    $("status").innerHTML='<div class="error">Payment required (HTTP 402). See the box above.</div>';
+  }else{
+    $("status").innerHTML='<div class="error">Error '+(r.status||"")+(data.error?": "+esc(data.error):"")+'</div>';}};
+</script>
+</body></html>"""
+
 
 # -------------------------------------------------------------- HTTP layer
 
@@ -1227,6 +1651,21 @@ class Handler(BaseHTTPRequestHandler):
         return {k: v[0] for k, v in
                 urllib.parse.parse_qs(raw).items()}
 
+    def _read_raw(self) -> bytes:
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length) if length > 0 else b""
+
+    def _read_json(self):
+        """Read a JSON request body. Returns (obj, error)."""
+        raw = self._read_raw()
+        if not raw:
+            return None, "Empty request body — send JSON, e.g. " \
+                         '{"url": "https://www.youtube.com/watch?v=..."}'
+        try:
+            return json.loads(raw.decode("utf-8")), None
+        except (ValueError, UnicodeDecodeError):
+            return None, "Request body is not valid JSON."
+
     # -- routes -------------------------------------------------------
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -1272,6 +1711,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/filings":
             self._handle_v1_filings(params)
             return
+        if path == "/video":
+            self._serve_video_page(user)
+            return
+        if path == "/api/v1/video/jobs/pending":
+            self._handle_video_pending()
+            return
+        if path.startswith("/api/v1/video/jobs/"):
+            job_id = path[len("/api/v1/video/jobs/"):]
+            if job_id and "/" not in job_id:
+                self._handle_video_job(job_id)
+                return
         if path == "/openapi.json":
             self._serve_openapi()
             return
@@ -1281,6 +1731,8 @@ class Handler(BaseHTTPRequestHandler):
                              "x402_price_usdc": X402_PRICE_USDC,
                              "x402_filings_price_usdc":
                                  X402_FILINGS_PRICE_USDC,
+                             "x402_video_price_usdc":
+                                 X402_VIDEO_PRICE_USDC,
                              "x402_network": X402_NETWORK,
                              "x402_pay_to": X402_PAY_TO})
             return
@@ -1370,6 +1822,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._redirect(f"/forum/post/{post_id}")
             return
+        if path == "/api/v1/video":
+            self._handle_v1_video()
+            return
+        if path.startswith("/api/v1/video/jobs/"):
+            rest = path[len("/api/v1/video/jobs/"):]
+            if rest.endswith("/complete"):
+                self._handle_video_complete(rest[:-len("/complete")])
+                return
+            if rest.endswith("/fail"):
+                self._handle_video_fail(rest[:-len("/fail")])
+                return
         self.send_error(404, "Not found")
 
     # -- page handlers ------------------------------------------------
@@ -1597,13 +2060,14 @@ class Handler(BaseHTTPRequestHandler):
         base_url = self._base_url().rstrip("/")
         resource_url = base_url + "/api/v1/search"
         filings_url = base_url + "/api/v1/filings"
+        video_url = base_url + "/api/v1/video"
         doc = {
             "x402Version": 2,
             "version": 1,
             "name": "DeepSearch Pro",
             "description": X402_DESCRIPTION,
             "url": base_url,
-            "resources": [resource_url, filings_url],
+            "resources": [resource_url, filings_url, video_url],
             "endpoints": [
                 {
                     "url": resource_url,
@@ -1616,6 +2080,12 @@ class Handler(BaseHTTPRequestHandler):
                     "method": "GET",
                     "description": X402_FILINGS_DESCRIPTION,
                     "accepts": [filings_x402_requirements(base_url)],
+                },
+                {
+                    "url": video_url,
+                    "method": "POST",
+                    "description": X402_VIDEO_DESCRIPTION,
+                    "accepts": [video_x402_requirements(base_url)],
                 },
             ],
         }
@@ -1647,6 +2117,17 @@ class Handler(BaseHTTPRequestHandler):
             " data: company, tickers, fiscal year end, filings by form"
             " and month, 8-K item counts, latest filings. $0.05 USDC"
             " on Base per call via x402; unpaid requests get HTTP 402.\n"
+            f"- [Learning video layer]({base}/api/v1/video): POST"
+            " /api/v1/video with JSON {\"url\": \"https://www.youtube.com"
+            "/watch?v=...\"} — full timestamped transcript, summary"
+            " with chapters, and every verifiable claim checked"
+            " against sources (SUPPORTED / CONTRADICTED / UNVERIFIED,"
+            " each with links and a timestamp). $0.10 USDC on Base per"
+            " video via x402; unpaid requests get HTTP 402. The job is"
+            " asynchronous: the 202 response carries a job_id, poll"
+            f" GET {base}/api/v1/video/jobs/<job_id> for the result."
+            " No ad-free playback: we do the learning, Firefox +"
+            " uBlock Origin (or YouTube Premium) does the blocking.\n"
             f"- [OpenAPI spec]({base}/openapi.json): full spec with"
             " x-payment-info on the paid operation.\n"
             f"- [Discovery manifest]({base}/.well-known/x402.json):"
@@ -1694,6 +2175,17 @@ class Handler(BaseHTTPRequestHandler):
                     "method": "GET",
                     "description": X402_FILINGS_DESCRIPTION,
                     "price_usdc": X402_FILINGS_PRICE_USDC,
+                    "network": X402_NETWORK,
+                    "asset": X402_ASSET,
+                    "payTo": X402_PAY_TO,
+                    "facilitator": X402_FACILITATOR,
+                },
+                {
+                    "path": "/api/v1/video",
+                    "url": base + "/api/v1/video",
+                    "method": "POST",
+                    "description": X402_VIDEO_DESCRIPTION,
+                    "price_usdc": X402_VIDEO_PRICE_USDC,
                     "network": X402_NETWORK,
                     "asset": X402_ASSET,
                     "payTo": X402_PAY_TO,
@@ -1840,6 +2332,239 @@ class Handler(BaseHTTPRequestHandler):
                              self._v1_payment_response)
         self.end_headers()
         self.wfile.write(data_out)
+
+    # -- learning video layer (Feature 5) ---------------------------
+    def _send_402_video(self, base_url: str):
+        """x402 v2 challenge for /api/v1/video: 402 + PAYMENT-REQUIRED."""
+        challenge = video_x402_challenge_b64(base_url)
+        body = json.dumps({
+            "error": "Payment required",
+            "message": ("This endpoint costs $0.10 USDC on Base per "
+                        "video analysis, paid via x402. Send an "
+                        "X-PAYMENT header or use an API key "
+                        "(?key= / X-API-Key)."),
+            "x402Version": 2,
+            "accepts": [video_x402_requirements(base_url)],
+        }).encode()
+        self.send_response(402)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("PAYMENT-REQUIRED", challenge)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_v1_video(self):
+        """POST /api/v1/video — create a video analysis job.
+
+        Auth FIRST, input validation second (same rule as search and
+        filings): an unpaid request gets the 402 challenge, not a 400.
+        The job is asynchronous — the home-server worker polls the
+        queue, does the transcript + summary + claim checks, and posts
+        the result back. The caller polls
+        GET /api/v1/video/jobs/<job_id> for it. Returns 202.
+        """
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        key = (params.get("key", [""])[0]
+               or self.headers.get("X-API-Key", ""))
+        user = get_user_by_api_key(key) if key else None
+        if user:
+            allowed, msg = can_api_call(user)
+            if not allowed:
+                self._send_json({"error": msg}, status=429)
+                return
+            record_api_call(user["id"])
+        else:
+            payment_header = self.headers.get("X-PAYMENT", "")
+            if not payment_header:
+                self._send_402_video(self._base_url())
+                return
+            try:
+                payment_payload = json.loads(
+                    base64.b64decode(payment_header).decode())
+            except Exception:
+                self._send_402_video(self._base_url())
+                return
+            ok, detail = x402_verify_and_settle(
+                payment_payload, self._base_url(),
+                video_x402_requirements(self._base_url()))
+            if not ok:
+                self._send_json(detail, status=402)
+                return
+            settle_b64 = base64.b64encode(
+                json.dumps(detail).encode()).decode()
+            self._v1_payment_response = settle_b64
+
+        body, err = self._read_json()
+        if err:
+            self._send_json({"error": err}, status=400)
+            return
+        url = (body or {}).get("url", "")
+        video_id, perr = parse_youtube_url(url)
+        if perr:
+            self._send_json({"error": perr}, status=400)
+            return
+        title, _author, oembed = fetch_youtube_oembed(video_id)
+        if oembed == "unknown":
+            self._send_json(
+                {"error": f"No YouTube video found for id {video_id} — "
+                          "it may be private, deleted, or never have "
+                          "existed."}, status=404)
+            return
+        job_id = create_video_job(
+            video_id, url.strip(), title,
+            "api_key" if user else "x402",
+            "0.00" if user else X402_VIDEO_PRICE_USDC)
+        payload = {
+            "job_id": job_id,
+            "video_id": video_id,
+            "title": title,
+            "status": "pending",
+            "result_url": f"/api/v1/video/jobs/{job_id}",
+            "paid_via": "api_key" if user else "x402",
+            "price_usdc": "0.00" if user else X402_VIDEO_PRICE_USDC,
+            "note": ("Processing is asynchronous and takes a few "
+                     "minutes. Poll result_url. Job state lives in "
+                     "this service's free-tier store and is lost if "
+                     "the service restarts before the job finishes."),
+        }
+        data = json.dumps(payload).encode()
+        self.send_response(202)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        if not user and getattr(self, "_v1_payment_response", None):
+            self.send_header("X-PAYMENT-RESPONSE",
+                             self._v1_payment_response)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_video_job(self, job_id: str):
+        """GET /api/v1/video/jobs/<id> — poll a job's status/result.
+
+        No payment needed here: the job id is an unguessable token,
+        and possession of it is the authorization.
+        """
+        row = get_video_job(job_id)
+        if not row:
+            self._send_json({"error": f"Unknown job id: {job_id}"},
+                            status=404)
+            return
+        self._send_json(video_job_to_dict(row))
+
+    def _worker_auth_ok(self, method: str, job_id: str,
+                        body: bytes) -> bool:
+        """Verify a worker request's Ed25519 signature (video_auth)."""
+        if not _VIDEO_AUTH_OK:
+            return False
+        return video_auth.verify_worker_request(
+            self.headers, method, job_id, body)
+
+    def _handle_video_pending(self):
+        """GET /api/v1/video/jobs/pending — worker claims next job.
+
+        Signed with the worker key (see video_auth.py). Claims the
+        oldest pending job (or a stale claim) and returns it; the
+        worker then does the work and posts the result back.
+        """
+        if not self._worker_auth_ok("pending", "-", b""):
+            self._send_json({"error": "Worker authentication failed."},
+                            status=401)
+            return
+        row = claim_next_video_job()
+        if not row:
+            self._send_json({"job": None})
+            return
+        self._send_json({"job": {
+            "job_id": row["id"],
+            "video_id": row["video_id"],
+            "url": row["url"],
+            "title": row["title"],
+        }})
+
+    def _handle_video_complete(self, job_id: str):
+        """POST /api/v1/video/jobs/<id>/complete — worker posts result.
+
+        Signed body: transcript {text, segments}, summary, chapters,
+        claims [{claim, timestamp, verdict, sources, reason}].
+        Verdicts are three-state only — SUPPORTED / CONTRADICTED /
+        UNVERIFIED — never a binary true/false.
+        """
+        raw = self._read_raw()
+        if not self._worker_auth_ok("complete", job_id, raw):
+            self._send_json({"error": "Worker authentication failed."},
+                            status=401)
+            return
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._send_json({"error": "Result body is not valid JSON."},
+                            status=400)
+            return
+        transcript = result.get("transcript") or {}
+        claims = result.get("claims") or []
+        chapters = result.get("chapters") or []
+        if not isinstance(transcript, dict) or \
+                not isinstance(transcript.get("segments", []), list):
+            self._send_json(
+                {"error": "Result transcript must be an object with a "
+                          "'segments' list."}, status=400)
+            return
+        if not isinstance(claims, list) or \
+                not isinstance(chapters, list):
+            self._send_json(
+                {"error": "Result claims and chapters must be lists."},
+                status=400)
+            return
+        for cl in claims:
+            if not isinstance(cl, dict) or \
+                    cl.get("verdict") not in (
+                        "SUPPORTED", "CONTRADICTED", "UNVERIFIED"):
+                self._send_json(
+                    {"error": "Every claim needs a verdict of "
+                              "SUPPORTED, CONTRADICTED or UNVERIFIED."},
+                    status=400)
+                return
+        if len(claims) > VIDEO_MAX_CLAIMS:
+            self._send_json(
+                {"error": f"Too many claims ({len(claims)}); max is "
+                          f"{VIDEO_MAX_CLAIMS} per video."}, status=400)
+            return
+        if not complete_video_job(job_id, {
+                "transcript": transcript,
+                "summary": result.get("summary") or "",
+                "chapters": chapters,
+                "claims": claims}):
+            self._send_json(
+                {"error": f"Job {job_id} is not in claimed state — it "
+                          "may have been re-queued after its lease "
+                          "expired."}, status=409)
+            return
+        self._send_json({"ok": True, "job_id": job_id,
+                         "status": "done"})
+
+    def _handle_video_fail(self, job_id: str):
+        """POST /api/v1/video/jobs/<id>/fail — worker reports failure."""
+        raw = self._read_raw()
+        if not self._worker_auth_ok("fail", job_id, raw):
+            self._send_json({"error": "Worker authentication failed."},
+                            status=401)
+            return
+        try:
+            result = json.loads(raw.decode("utf-8"))
+            error = str(result.get("error", "")) or "Unknown error."
+        except (ValueError, UnicodeDecodeError):
+            error = "Worker failure report was not valid JSON."
+        if not fail_video_job(job_id, error):
+            self._send_json(
+                {"error": f"Job {job_id} is not in claimed state."},
+                status=409)
+            return
+        self._send_json({"ok": True, "job_id": job_id,
+                         "status": "failed"})
+
+    def _serve_video_page(self, user):
+        body = VIDEO_PAGE.replace("{nav}", _nav(user))
+        self._send_html(body)
 
     def _base_url(self) -> str:
         host = self.headers.get("Host", "deepsearch-pro.onrender.com")
@@ -2009,7 +2734,54 @@ class Handler(BaseHTTPRequestHandler):
                             "502": {"description": "EDGAR unreachable."},
                         },
                     }
-                }
+                },
+                "/api/v1/video": {
+                    "post": {
+                        "summary": "Learn from a YouTube video (pay-per-call)",
+                        "description": X402_VIDEO_DESCRIPTION + " The job "
+                            "is asynchronous: the 202 response carries a "
+                            "job_id; poll GET /api/v1/video/jobs/{job_id} "
+                            "for the transcript, summary, chapters and "
+                            "sourced claim verdicts.",
+                        "x-payment-info": {
+                            "scheme": "exact",
+                            "network": X402_NETWORK,
+                            "price": f"${X402_VIDEO_PRICE_USDC}",
+                            "asset": "USDC",
+                            "payTo": X402_PAY_TO,
+                        },
+                        "requestBody": {
+                            "required": True,
+                            "content": {"application/json": {"schema": {
+                                "type": "object",
+                                "properties": {"url": {
+                                    "type": "string",
+                                    "description": "YouTube video URL"}},
+                                "required": ["url"]}}}},
+                        "responses": {
+                            "202": {"description": "Job created; poll the "
+                                    "result URL."},
+                            "402": {"description": "Payment required (x402)."},
+                            "400": {"description": "Missing/invalid URL."},
+                            "404": {"description": "Video not found."},
+                        },
+                    }
+                },
+                "/api/v1/video/jobs/{job_id}": {
+                    "get": {
+                        "summary": "Poll a video job's status and result",
+                        "parameters": [
+                            {"name": "job_id", "in": "path",
+                             "required": True,
+                             "schema": {"type": "string"}}],
+                        "responses": {
+                            "200": {"description": "Job status; when done, "
+                                    "the transcript, summary, chapters "
+                                    "and claims."},
+                            "404": {"description": "Unknown job id."},
+                        },
+                    }
+                },
             },
         }
         self._send_json(spec)

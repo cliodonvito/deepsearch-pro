@@ -4,6 +4,28 @@ The Deep Search tool (186 engines) productized as a hosted SaaS.
 **Live:** https://deepsearch-pro.onrender.com/ (Render free tier, GitHub:
 cliodonvito/deepsearch-pro). Payments: Payzum (see PAYZUM_SETUP.md).
 
+## New in this update (2026-11-26, v1.4)
+
+- **Learning video layer (`/video`, `POST /api/v1/video`)** — paste a
+  YouTube URL, get the full timestamped transcript, a summary with
+  chapters, and every verifiable claim checked against sources
+  (SUPPORTED / CONTRADICTED / UNVERIFIED, each with links and the
+  timestamp in the video). $0.10 USDC on Base per video via x402, or
+  free with an API-tier key. Jobs are asynchronous: the 202 response
+  carries a `job_id`; poll `GET /api/v1/video/jobs/<job_id>`.
+  The transcript worker runs on the home server (residential IP —
+  YouTube blocks caption fetches from datacenter IPs) and polls a job
+  queue over outbound HTTPS; worker requests are signed with Ed25519
+  (`video_auth.py`, `ed25519.py`). The home server is never exposed.
+  **Ad-free playback is explicitly out of scope** — the page says so
+  plainly and points at Firefox + uBlock Origin or YouTube Premium.
+  Transcript via yt-dlp captions (faster-whisper fallback), summary +
+  claims via local llama3.1:8b (Ollama), verification search via this
+  service's own engines. Verified end to end on a real video (Kurzgesagt,
+  "The Fermi Paradox", 6 min: 28 transcript segments, 10 chapters,
+  8 claims — 6 SUPPORTED, 2 UNVERIFIED — each with sources).
+  Job state is ephemeral like the forum (lost on redeploy).
+
 ## New in this update (2026-11-25)
 
 - **x402 pay-per-search API (`/api/v1/search`)** — AI agents pay $0.02 in
@@ -35,6 +57,8 @@ cliodonvito/deepsearch-pro). Payments: Payzum (see PAYZUM_SETUP.md).
 | `deepsearch_pro.py` | The Pro server — auth, tiers, rate limiting, JSON API, Teleport webhook |
 | `search_engines.py` | Copy of the 186-engine search orchestrator (unchanged from the home tool) |
 | `landing.html` | Landing page with pricing tiers and engine coverage |
+| `video_auth.py` | Ed25519 verification for the home-server video worker (`ed25519.py` is the pure-Python implementation) |
+| `video-worker.py` | The video worker (runs on the home server, NOT on Render — see the v1.4 note above; deployed to `~/clio-work/video-worker/` on the server) |
 | `upgrade_user.py` | Manual tier management CLI (for Phase 1, before webhooks) |
 | `TELEPORT_INTEGRATION.md` | Teleport payment plan — Free plan launch + Custom plan upgrade path |
 | `deepsearch_pro.db` | SQLite database (created on first run) |
