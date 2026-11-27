@@ -754,6 +754,11 @@ def filings_x402_requirements(base_url: str) -> dict:
                     "total_filings_in_range": 120,
                     "tallies": {"by_form": {"10-K": 2, "10-Q": 8,
                                             "8-K": 24}}},
+                # PayAPI Market's pre-check reads
+                # extensions.bazaar.info.input for its test call; the
+                # spec field above (exampleInput) was not picked up.
+                # Apple Inc. (AAPL) — a real example query.
+                "info": {"input": {"cik": "0000320193", "years": 2}},
             }
         },
     }
